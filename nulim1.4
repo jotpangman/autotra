@@ -1,0 +1,311 @@
+# -*- coding: utf-8 -*-
+"""
+올인원 Mark1.4 (호환+완화형 기관필터):
+- 시세(OHLCV): KOSPI/KOSDAQ 전체 조회 (빠름, by_ticker)
+- 수급(투자자별): 종목별 조회 + 캐시 (호환성)
+- 캐시: 오늘 날짜 캐시는 보존, 나머지는 자동 삭제
+- 진행: 10종목마다 매트릭스(0/1) + (진행/총)
+- 저장: 끝나면 [Enter=저장 / ESC=취소], 파일명 YYMMDD-HHMM.csv
+- 숫자: 출력/저장 시에만 천 단위 쉼표(정렬 정확도 위해 내부는 숫자형 유지)  # [수정]
+- 기관 컬럼: 기관합계 없으면 (금융투자+투신+보험+은행+연기금 등) 합산
+- 기관 필터: 최근 N일 합계>0 등 완화형 규칙 선택 가능
+"""
+
+import pandas as pd
+import numpy as np
+from pykrx import stock
+import datetime
+import os
+import sys
+import random
+import pickle
+import msvcrt  # Windows 전용: Enter / ESC 감지
+
+pd.set_option('future.no_silent_downcasting', True)
+
+# ===============================
+# 경로 / 출력 / 실행 옵션
+# ===============================
+CACHE_DIR = os.path.join(os.getenv("LOCALAPPDATA", os.path.expanduser("~")), "pullback_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+OUTPUT_DIR = os.path.abspath(".")
+
+TOPN = 50
+
+# --- 기관 순매수 필터 (완화형) ---
+USE_INST_FILTER = True   # 기관 필터 사용 여부
+INST_LOOKBACK = 3        # 최근 N일
+# "sum_pos"=N일 합계>0, "any_pos"=N일 중 하루라도 +, "k_of_n"=N일 중 K일 +
+INST_RULE = "sum_pos"
+INST_K = 2               # "k_of_n"일 때 사용
+
+# ===============================
+# 캐시: 오늘만 보존
+# ===============================
+def purge_cache_keep_today():
+    today = datetime.datetime.today().strftime("%Y%m%d")
+    removed = 0
+    for fname in os.listdir(CACHE_DIR):
+        if today in fname:
+            continue
+        fpath = os.path.join(CACHE_DIR, fname)
+        if os.path.isfile(fpath):
+            try:
+                os.remove(fpath)
+                removed += 1
+            except:
+                pass
+    print(f"🧹 캐시 삭제 완료 ({removed} files, 오늘 캐시는 보존)")
+
+# ===============================
+# 진행 표시(매트릭스)
+# ===============================
+def matrix_progress(processed: int, total: int, width: int = 48, label: str = "조건 검색중"):
+    bar = "".join(random.choice(["0", "1"]) for _ in range(width))
+    sys.stdout.write(f"\r[{bar}] {label}  ({processed}/{total})")
+    sys.stdout.flush()
+
+# ===============================
+# [패치 A] 최근 영업일 판정 강화  # [수정]
+# - pykrx가 장중/미게시/휴일에 스키마가 달라져 발생하는 KeyError 방지
+# ===============================
+def get_recent_business_day(max_back: int = 10) -> str:
+    today_dt = datetime.datetime.today()
+    today = today_dt.strftime("%Y%m%d")
+    for i in range(0, max_back):
+        day = today_dt - datetime.timedelta(days=i)
+        date = day.strftime("%Y%m%d")
+        try:
+            df = stock.get_market_ohlcv_by_ticker(date, market="KOSPI")
+            # 필수 컬럼 검사 + 종가 합계>0 + 행 수 충분
+            if isinstance(df, pd.DataFrame) and {"종가", "거래량"}.issubset(df.columns):
+                if len(df) > 100 and (pd.to_numeric(df["종가"], errors="coerce").sum() > 0):
+                    print("📅 기준일:", date)
+                    if date != today:
+                        print(f"ℹ️ 오늘 데이터 미게시/휴일 감지 → 최근 영업일({date}) 기준으로 분석합니다.")
+                    return date
+        except:
+            continue
+    # 폴백: 전일
+    fallback = (today_dt - datetime.timedelta(days=1)).strftime("%Y%m%d")
+    print("📅 기준일:", fallback)
+    print(f"ℹ️ 데이터 확인 실패 → 전일({fallback})로 대체합니다.")
+    return fallback
+
+# ===============================
+# 수급 날씨
+# ===============================
+def _weather_from_series(values: list[float]) -> str:
+    vals = [v for v in values if pd.notna(v)]
+    if not vals:
+        return "❓"
+    last3 = vals[-3:] if len(vals) >= 3 else vals
+    if all(v > 0 for v in last3):
+        return "☀️ 맑음"
+    if all(v < 0 for v in last3):
+        return "⛈️ 폭우"
+    return "🌤️ 반등기미" if last3[-1] > 0 else "🌧️ 약세"
+
+def get_investor_weathers(df: pd.DataFrame) -> dict:
+    """투자자별 거래대금 DF → 날씨 이모지"""
+    if df is None or df.empty:
+        return {"개미날씨": "❓", "기관날씨": "❓", "외국인날씨": "❓"}
+
+    cols = df.columns.tolist()
+    # 개인 / 외국인
+    col_personal = "개인" if "개인" in cols else None
+    col_foreign  = "외국인" if "외국인" in cols else None
+
+    # 기관: 기관합계 > 기관 > 세부항목 합산(금융투자, 투신, 보험, 은행, 연기금 등)
+    inst_values: list[float] = []
+    if "기관합계" in cols:
+        inst_values = pd.to_numeric(df["기관합계"], errors="coerce").tolist()
+    elif "기관" in cols:
+        inst_values = pd.to_numeric(df["기관"], errors="coerce").tolist()
+    else:
+        parts = [c for c in ["금융투자", "투신", "보험", "은행", "연기금 등"] if c in cols]
+        if parts:
+            inst_values = pd.to_numeric(df[parts].sum(axis=1), errors="coerce").tolist()
+
+    return {
+        "개미날씨": _weather_from_series(df[col_personal].tolist()) if col_personal else "❓",
+        "기관날씨": _weather_from_series(inst_values) if inst_values else "❓",
+        "외국인날씨": _weather_from_series(df[col_foreign].tolist()) if col_foreign else "❓",
+    }
+
+# --- 기관 순매수 필터 규칙 ---
+def inst_netbuy_ok(df_trade: pd.DataFrame) -> bool:
+    if df_trade is None or df_trade.empty:
+        return False
+
+    cols = df_trade.columns.tolist()
+    if "기관합계" in cols:
+        s = pd.to_numeric(df_trade["기관합계"], errors="coerce")
+    elif "기관" in cols:
+        s = pd.to_numeric(df_trade["기관"], errors="coerce")
+    else:
+        parts = [c for c in ["금융투자", "투신", "보험", "은행", "연기금 등"] if c in cols]
+        if not parts:
+            return False
+        s = pd.to_numeric(df_trade[parts].sum(axis=1), errors="coerce")
+
+    last = s.dropna().tail(INST_LOOKBACK)
+    if last.empty:
+        return False
+
+    if INST_RULE == "sum_pos":
+        return last.sum() > 0
+    elif INST_RULE == "any_pos":
+        return (last > 0).any()
+    elif INST_RULE == "k_of_n":
+        return (last > 0).sum() >= max(1, int(INST_K))
+    else:
+        return False
+
+# ===============================
+# 캐시 활용: 종목별 수급 조회
+# ===============================
+def get_cached_trading_value(code: str, start: str, end: str) -> pd.DataFrame:
+    cache_path = os.path.join(CACHE_DIR, f"trading_{code}_{end}.pkl")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except:
+            pass
+    try:
+        df = stock.get_market_trading_value_by_date(start, end, code, detail=True)
+        if df is not None and not df.empty:
+            for col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            with open(cache_path, "wb") as f:
+                pickle.dump(df, f)
+        return df
+    except:
+        return pd.DataFrame()
+
+# ===============================
+# 저장 여부 확인 (Enter=저장, ESC=취소)
+# ===============================
+def confirm_and_save(df_out: pd.DataFrame, out_dir: str):
+    print("\n저장하시겠습니까?  [Enter = 저장 / ESC = 취소]")
+    while True:
+        ch = msvcrt.getch()
+        if ch in (b'\r', b'\n'):  # Enter
+            ts = datetime.datetime.now().strftime("%y%m%d-%H%M")  # 예: 250818-1420
+            out_path = os.path.join(out_dir, f"{ts}.csv")
+            df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
+            print(f"\n✅ 저장 완료: {out_path}")
+            break
+        elif ch == b'\x1b':  # ESC
+            print("\n🛑 저장 취소 (CSV 생성하지 않음)")
+            break
+
+# ===============================
+# 메인
+# ===============================
+def run_inflow_weather_screen(topn: int = TOPN):
+    purge_cache_keep_today()
+
+    base_date = get_recent_business_day()  # [수정] 강화된 함수 사용
+
+    # 전체 시세 한방 조회 (KOSPI+KOSDAQ)
+    ohlcv_kospi = stock.get_market_ohlcv_by_ticker(base_date, market="KOSPI")
+    ohlcv_kosdaq = stock.get_market_ohlcv_by_ticker(base_date, market="KOSDAQ")
+    ohlcv_all = pd.concat([ohlcv_kospi, ohlcv_kosdaq])
+    ohlcv_all.reset_index(inplace=True)  # '티커' 컬럼 생성
+
+    # 숫자 컬럼 강제 수치화 + 결측 0 채움  # [수정]
+    for col in ["시가", "고가", "저가", "종가", "거래량", "거래대금"]:
+        if col in ohlcv_all.columns:
+            ohlcv_all[col] = pd.to_numeric(ohlcv_all[col], errors="coerce").fillna(0)
+
+    # 유니버스
+    codes = ohlcv_all["티커"].tolist()
+    names = [stock.get_market_ticker_name(c) for c in codes]
+
+    results = []
+    total = len(codes)
+
+    for idx, (code, name) in enumerate(zip(codes, names), start=1):
+        # 진행표시는 10종목마다
+        if idx % 10 == 0:
+            matrix_progress(idx, total, label="눌림목 조건 검색중")
+
+        try:
+            row = ohlcv_all[ohlcv_all["티커"] == code].iloc[0]
+
+            # ================================
+            # [패치 B] 시세 컬럼 안전 접근 + 거래대금 보강  # [수정]
+            # ================================
+            try:
+                close = int(pd.to_numeric(row["종가"], errors="coerce"))
+                vol = int(pd.to_numeric(row["거래량"], errors="coerce"))
+            except Exception:
+                continue
+
+            if "거래대금" in ohlcv_all.columns:
+                try:
+                    turnover = int(pd.to_numeric(row["거래대금"], errors="coerce"))
+                except Exception:
+                    turnover = close * vol
+            else:
+                turnover = close * vol
+
+            # 수급 데이터 (최근 7일)
+            dt = datetime.datetime.strptime(base_date, "%Y%m%d")
+            start = (dt - datetime.timedelta(days=7)).strftime("%Y%m%d")
+            df_trade = get_cached_trading_value(code, start, base_date)
+
+            # 날씨
+            w = get_investor_weathers(df_trade)
+
+            # 기관 필터(완화형 규칙)
+            if USE_INST_FILTER and not inst_netbuy_ok(df_trade):
+                continue
+
+            # results는 숫자형 유지 (정렬 정확도)  # [수정]
+            results.append({
+                "종목코드": code,
+                "종목명": name,
+                "현재가": close,        # int 유지
+                "거래량": vol,          # int 유지
+                "거래대금": turnover,   # int 유지
+                "개미날씨": w["개미날씨"],
+                "기관날씨": w["기관날씨"],
+                "외국인날씨": w["외국인날씨"],
+            })
+        except:
+            continue
+
+    # 진행줄 정리
+    sys.stdout.write("\r" + " " * 90 + "\r")
+    sys.stdout.flush()
+
+    if not results:
+        print("⚠️ 결과 없음 (기관 필터가 너무 엄격하면 INST_RULE 또는 INST_LOOKBACK 완화 추천)")
+        return
+
+    # ================================
+    # [패치 C] 숫자 정렬 후 출력/저장 시에만 포맷  # [수정]
+    # ================================
+    df_out = pd.DataFrame(results).sort_values(
+        by=["거래량", "거래대금"], ascending=[False, False]
+    ).head(topn)
+
+    # 화면 출력용 포맷 적용본
+    df_print = df_out.copy()
+    for _col in ["현재가", "거래량", "거래대금"]:
+        if _col in df_print.columns:
+            df_print[_col] = df_print[_col].map(lambda x: f"{int(x):,}")
+
+    print("\n미리보기:")
+    print(df_print.to_string(index=False))
+
+    # 저장 여부 확인 (포맷 적용본 저장)
+    confirm_and_save(df_print, OUTPUT_DIR)
+
+
+if __name__ == "__main__":
+    run_inflow_weather_screen(topn=TOPN)
+    input("\n\n▶ 실행이 완료되었습니다. Enter 키를 누르면 창이 닫힙니다...")
